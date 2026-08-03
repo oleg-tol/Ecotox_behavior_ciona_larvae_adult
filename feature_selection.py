@@ -3,13 +3,13 @@
 """
 Feature pre-filtering and PCA for the larval and adult behavioural space.
 
-The same pipeline applies to both species; only the input feature matrix
+The same pipeline applies to both stages; only the input feature matrix
 and metadata differ.
 
 Pipeline
 --------
 1. log_transform         : reduce right skew in strictly positive metrics
-2. outlier_removal       : per-group multivariate outlier screen (top 5%)
+2. impute_missing_by_group : per-group median imputation 
 3. cv_filter             : drop metrics with insufficient between-animal variation
 4. correlation_filter    : drop redundant metrics (keep higher-variance of each pair)
 5. standardise           : z-score all surviving metrics
@@ -25,8 +25,6 @@ from sklearn.decomposition import PCA
 # ── Default thresholds ────────────────────────────────────────────────────────
 CV_MIN          = 0.10   # minimum coefficient of variation to keep a metric
 CORR_MAX        = 0.70   # maximum Spearman |r| before one metric is dropped
-OUTLIER_PCT     = 0.95   # within-group percentile above which animals are removed
-MIN_COMPLETENESS= 0.80   # minimum fraction of non-missing metrics per animal
 N_PCA_COMPONENTS= 10     # maximum number of PCs to retain
 
 
@@ -54,58 +52,19 @@ def log_transform(df: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2  COMPLETENESS FILTER + OUTLIER REMOVAL
+# STEP 2  PER-GROUP MEDIAN IMPUTATION  (no animals or metrics excluded)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def completeness_filter(df: pd.DataFrame,
-                         metrics: list[str],
-                         min_fraction: float = MIN_COMPLETENESS
-                         ) -> pd.DataFrame:
-    """
-    Remove animals with fewer than min_fraction of metrics observed.
-    No imputation is performed; metrics still missing after this filter are
-    dropped by drop_incomplete_metrics() below.
-    """
-    ok = df[metrics].notna().mean(axis=1) >= min_fraction
-    return df[ok].copy()
-
-
-def drop_incomplete_metrics(df: pd.DataFrame,
-                              metrics: list[str]) -> list[str]:
-    """
-    Return only those metrics that are fully observed (no NaN) across all
-    surviving animals.  Called after completeness_filter() so that no
-    imputation is needed.
-    """
-    return [m for m in metrics if df[m].notna().all()]
-
-
-def outlier_removal(df: pd.DataFrame,
-                     metrics: list[str],
-                     group_col: str,
-                     percentile: float = OUTLIER_PCT) -> pd.DataFrame:
-    """
-    Per-group multivariate outlier screen.
-
-    For each treatment group, each animal is scored by the sum of squared
-    within-group z-scores across all candidate metrics (a simplified
-    Mahalanobis-like distance).  Animals above the percentile-th percentile
-    of that score within their group are excluded.
-
-    This removes animals with unusual feature combinations relative to
-    their own treatment group, preserving genuine drug effects rather than
-    removing them as outliers against the control.
-    """
-    keep_rows = []
-    for grp, idx in df.groupby(group_col).groups.items():
-        sub = df.loc[idx, metrics]
-        mn  = sub.mean(axis=0)
-        sd  = sub.std(ddof=1, axis=0).replace(0, np.nan)
-        zsc = ((sub - mn) / sd).fillna(0)
-        dist = (zsc ** 2).sum(axis=1)
-        thr  = dist.quantile(percentile)
-        keep_rows.extend(idx[dist <= thr].tolist())
-    return df.loc[keep_rows].copy()
+def impute_missing_by_group(df: pd.DataFrame,
+                             metrics: list[str],
+                             group_col: str) -> pd.DataFrame:
+    df = df.copy()
+    for m in metrics:
+        if m not in df.columns:
+            continue
+        df[m] = df.groupby(group_col)[m].transform(lambda s: s.fillna(s.median()))
+        df[m] = df[m].fillna(df[m].median())
+    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,8 +76,6 @@ def cv_filter(df: pd.DataFrame,
               cv_min: float = CV_MIN) -> tuple[list[str], pd.DataFrame]:
     """
     Drop metrics with coefficient of variation (std / |mean|) below cv_min.
-
-    
     """
     kept  = []
     audit = []
@@ -254,9 +211,7 @@ def full_pipeline(df: pd.DataFrame,
                   group_col: str,
                   cv_min:    float = CV_MIN,
                   corr_max:  float = CORR_MAX,
-                  min_completeness: float = MIN_COMPLETENESS,
-                  outlier_pct:      float = OUTLIER_PCT,
-                  n_pca_components: int   = N_PCA_COMPONENTS,
+                  n_pca_components: int = N_PCA_COMPONENTS,
                   verbose: bool = True
                   ) -> dict:
     """
@@ -267,52 +222,45 @@ def full_pipeline(df: pd.DataFrame,
     df              : wide DataFrame, one row per animal
     metrics         : candidate metric column names
     log_metrics     : subset of metrics to log-transform
-    group_col       : column identifying treatment groups for outlier removal
+    group_col       : column identifying treatment groups (used for
+                      per-group median imputation)
     verbose         : print progress and audit information
 
     Returns a dict with keys:
-        df_clean    : filtered animal DataFrame with PC scores appended
+        df_clean    : full animal DataFrame (no exclusions) with PC scores appended
         metrics     : list of metrics that survived all filters
         pca         : fitted sklearn PCA object
         scaler      : fitted StandardScaler
-        audit       : dict of audit DataFrames (cv, correlation, dropped metrics)
+        audit       : dict of audit DataFrames (cv, correlation)
     """
     def _log(msg):
         if verbose: print(msg)
 
+    n0 = len(df)
+
     # 1. Log transform
     df = log_transform(df, metrics, log_metrics)
 
-    # 2. Completeness filter
-    n0 = len(df)
-    df = completeness_filter(df, metrics, min_completeness)
-    _log(f"  Completeness filter: {n0} → {len(df)} animals")
+    # 2. Per-group median imputation -- no animals or metrics dropped
+    df = impute_missing_by_group(df, metrics, group_col)
+    _log(f"  Imputation: {n0} animals retained (no exclusions), "
+         f"{len(metrics)} candidate metrics imputed per-group where needed")
 
-    # 3. Drop metrics with residual missing values (no imputation)
-    metrics = drop_incomplete_metrics(df, metrics)
-    _log(f"  Metrics with complete data: {len(metrics)}")
-
-    # 4. Outlier removal
-    n0 = len(df)
-    df = outlier_removal(df, metrics, group_col, outlier_pct)
-    _log(f"  Outlier removal:    {n0} → {len(df)} animals "
-         f"({n0 - len(df)} removed, top {(1-outlier_pct)*100:.0f}% per group)")
-
-    # 5. CV filter
+    # 3. CV filter
     metrics, cv_audit = cv_filter(df, metrics, cv_min)
     _log(f"  CV filter (>{cv_min}): {len(metrics)} metrics kept")
 
-    # 6. Correlation filter
+    # 4. Correlation filter
     metrics, corr_audit = correlation_filter(df, metrics, corr_max)
     _log(f"  Correlation filter (<{corr_max}): {len(metrics)} metrics kept")
     if verbose and len(corr_audit):
         for _, r in corr_audit.iterrows():
             print(f"    {r['metric']:30s}  {r['decision']}")
 
-    # 7. Standardise
+    # 5. Standardise
     X, scaler = standardise(df, metrics)
 
-    # 8. PCA
+    # 6. PCA
     Z, pca = run_pca(X, n_pca_components)
     var    = pca.explained_variance_ratio_
     _log(f"  PCA: PC1={var[0]*100:.1f}%  PC2={var[1]*100:.1f}%  "
